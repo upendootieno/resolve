@@ -6,10 +6,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     # ── Database ──────────────────────────────────────────────────────────────
-    database_url: str = "sqlitecloud://cczvv5ejdk.g3.sqlite.cloud:8860/auth.sqlitecloud?apikey=Uy07gwgw0K5PtPg8LDOsN4HYvmcVPvka4yFdeiXDtFs"
+    database_url: str  # required — set via env var or .env file
 
     # ── JWT ───────────────────────────────────────────────────────────────────
-    secret_key: str = "change-me-in-production-use-a-long-random-string"
+    secret_key: str    # required — set via env var or .env file
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
     refresh_token_expire_days: int = 30

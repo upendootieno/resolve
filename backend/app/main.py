@@ -54,8 +54,3 @@ app.include_router(notifications.router, prefix=PREFIX)
 @app.get(f"{PREFIX}/health", tags=["health"])
 async def health() -> dict:
     return {"status": "ok"}
-
-
-@app.get(f"{PREFIX}/health", tags=["health"])
-async def health() -> dict:
-    return {"status": "ok"}
