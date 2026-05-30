@@ -1,4 +1,9 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   runApp(const EyeApp());
@@ -11,7 +16,7 @@ class EyeApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'VisionCare',
+      title: 'Eye Resolve',
       theme: ThemeData(
         useMaterial3: true,
         scaffoldBackgroundColor: const Color(0xFFF0F4F8),
@@ -31,6 +36,8 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> {
   int _index = 0;
+
+  void navigateTo(int index) => setState(() => _index = index);
 
   late final List<Widget> _pages = const [
     HomeDashboardPage(),
@@ -123,6 +130,43 @@ class _BottomNav extends StatelessWidget {
 class HomeDashboardPage extends StatelessWidget {
   const HomeDashboardPage({super.key});
 
+  static Future<void> _showLogPressureDialog(BuildContext context) async {
+    final controller = TextEditingController();
+    final value = await showDialog<String>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('Log Eye Pressure'),
+        content: TextField(
+          controller: controller,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(
+            labelText: 'Pressure (mmHg)',
+            hintText: 'e.g. 14',
+            suffixText: 'mmHg',
+          ),
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogCtx, controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (value != null && value.isNotEmpty && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Pressure reading of $value mmHg saved.')),
+      );
+      context.findAncestorStateOfType<_MainShellState>()?.navigateTo(3);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     const primary = Color(0xFF00326B);
@@ -134,7 +178,7 @@ class HomeDashboardPage extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const _TopBar(title: 'VisionCare'),
+            const _TopBar(title: 'Eye Resolve'),
             const SizedBox(height: 22),
             const Text(
               'Good morning, Patient',
@@ -237,7 +281,7 @@ class HomeDashboardPage extends StatelessWidget {
                   borderRadius: BorderRadius.circular(14),
                 ),
               ),
-              onPressed: () {},
+              onPressed: () => HomeDashboardPage._showLogPressureDialog(context),
               icon: const Icon(Icons.add_circle, size: 30),
               label: const Text(
                 'Quick Log Pressure',
@@ -333,7 +377,12 @@ class HomeDashboardPage extends StatelessWidget {
                       foregroundColor: primary,
                       minimumSize: const Size(double.infinity, 52),
                     ),
-                    onPressed: () {},
+                    onPressed: () async {
+                      final uri = Uri.parse(
+                        'https://www.google.com/maps/search/?api=1&query=Central+Eye+Clinic+ophthalmologist',
+                      );
+                      await launchUrl(uri, mode: LaunchMode.externalApplication);
+                    },
                     icon: const Icon(Icons.map),
                     label: const Text('Get Directions'),
                   ),
@@ -347,8 +396,135 @@ class HomeDashboardPage extends StatelessWidget {
   }
 }
 
-class ClinicsPage extends StatelessWidget {
+class ClinicsPage extends StatefulWidget {
   const ClinicsPage({super.key});
+
+  @override
+  State<ClinicsPage> createState() => _ClinicsPageState();
+}
+
+class _ClinicsPageState extends State<ClinicsPage> {
+  final TextEditingController _searchController = TextEditingController();
+
+  List<_ClinicPlace> _clinics = const [];
+  bool _isLoading = false;
+  String? _errorMessage;
+  String _locationLabel = 'your location';
+  String? _selectedSpecialty;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadNearbyClinics();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadNearbyClinics() async {
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+      _locationLabel = 'your location';
+    });
+
+    try {
+      final position = await _resolveCurrentPosition();
+      final clinics = await _LocationApi.findNearbyClinics(
+        latitude: position.latitude,
+        longitude: position.longitude,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _clinics = clinics;
+        _isLoading = false;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isLoading = false;
+        _errorMessage = error.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  Future<void> _searchLocation() async {
+    final query = _searchController.text.trim();
+    if (query.isEmpty) {
+      await _loadNearbyClinics();
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    try {
+      final target = await _LocationApi.geocodeLocation(query);
+      if (target == null) {
+        throw Exception('No matching location found for "$query".');
+      }
+
+      final clinics = await _LocationApi.findNearbyClinics(
+        latitude: target.latitude,
+        longitude: target.longitude,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _locationLabel = query;
+        _clinics = clinics;
+        _isLoading = false;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isLoading = false;
+        _errorMessage = error.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  Future<Position> _resolveCurrentPosition() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      throw Exception('Location services are off. Please enable GPS and retry.');
+    }
+
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+
+    if (permission == LocationPermission.denied) {
+      throw Exception('Location permission denied.');
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      throw Exception('Location permission denied forever. Update it in settings.');
+    }
+
+    return Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -363,9 +539,16 @@ class ClinicsPage extends StatelessWidget {
             const _TopBar(title: 'Clinics'),
             const SizedBox(height: 22),
             TextField(
+              controller: _searchController,
+              textInputAction: TextInputAction.search,
+              onSubmitted: (_) => _searchLocation(),
               decoration: InputDecoration(
                 prefixIcon: const Icon(Icons.search, size: 30, color: primary),
-                hintText: 'Find nearby clinics',
+                suffixIcon: IconButton(
+                  onPressed: _searchLocation,
+                  icon: const Icon(Icons.travel_explore, color: primary),
+                ),
+                hintText: 'Search a town or address',
                 filled: true,
                 fillColor: Colors.white,
                 border: OutlineInputBorder(
@@ -380,71 +563,123 @@ class ClinicsPage extends StatelessWidget {
             ),
             const SizedBox(height: 18),
             Container(
-              height: 230,
+              height: 200,
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(color: primary, width: 3),
-                image: const DecorationImage(
-                  image: NetworkImage(
-                    'https://lh3.googleusercontent.com/aida-public/AB6AXuCMZ4THjVrO577_60OXDe_K-XWlmb4-P20uDmHUh3TrZ4wPocI6iJr_2Iovr0k7RHiJl_ly9nrzqJbe2Xv-yhufWxiRzcdESXRBLll7wtiS47MPUnWPwtpQwxDmxfV_gy7vscZVdxAUWG-JKa0Hbf7KDCZXiDgyaY-MTCt8TbyrvoS27i2IHMVXUE5ctem9WSir34fhSro04mRaxbpctbnmZmHQSE7MXc--wpKruQAzzChahbzrveaEBCx28mKnm_5OXYdtveaolmQ',
-                  ),
-                  fit: BoxFit.cover,
-                  colorFilter: ColorFilter.mode(Colors.black45, BlendMode.darken),
+                gradient: const LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [Color(0xFF0F3760), Color(0xFF1B6EA9)],
                 ),
               ),
-              child: Center(
-                child: FilledButton.icon(
-                  onPressed: () {},
-                  style: FilledButton.styleFrom(backgroundColor: primary),
-                  icon: const Icon(Icons.my_location),
-                  label: const Text('Show map view'),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Text(
+                      'Live Search Area',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 24,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Showing clinics near $_locationLabel',
+                      style: const TextStyle(
+                        color: Color(0xFFD2E9FF),
+                        fontSize: 17,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _loadNearbyClinics,
+                          style: FilledButton.styleFrom(backgroundColor: Colors.white),
+                          icon: const Icon(Icons.my_location, color: primary),
+                          label: const Text('Use My Location', style: TextStyle(color: primary)),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
             ),
             const SizedBox(height: 22),
-            const Text(
+            Text(
               'Nearby Recommendations',
-              style: TextStyle(
+              style: const TextStyle(
                 color: primary,
                 fontSize: 30,
                 fontWeight: FontWeight.w700,
               ),
             ),
             const SizedBox(height: 12),
-            const _ClinicCard(
-              name: 'Central Eye Clinic',
-              distance: '0.5 miles away',
-              status: 'Open now',
-              price: r'$45.00',
-              tag: 'Cheapest in your area for this service',
-              progress: 0.33,
-            ),
-            const SizedBox(height: 14),
-            const _ClinicCard(
-              name: 'Vision Center',
-              distance: '1.2 miles away',
-              status: 'Closes at 6 PM',
-              price: r'$62.00',
-              tag: 'Premium facility with shortest wait times',
-              progress: 0.66,
-            ),
-            const SizedBox(height: 14),
-            OutlinedButton.icon(
-              onPressed: () {},
-              style: OutlinedButton.styleFrom(
-                minimumSize: const Size(double.infinity, 66),
-                side: const BorderSide(color: primary, width: 3),
-              ),
-              icon: const Icon(Icons.list, color: primary),
-              label: const Text(
-                'View 12 more clinics',
-                style: TextStyle(
-                  color: primary,
-                  fontSize: 22,
-                  fontWeight: FontWeight.w700,
+            if (_isLoading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 36),
+                child: Center(child: CircularProgressIndicator(color: primary)),
+              )
+            else if (_errorMessage != null)
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: const Color(0xFFE49898), width: 2),
+                ),
+                child: Column(
+                  children: [
+                    Text(
+                      _errorMessage!,
+                      style: const TextStyle(color: Color(0xFF7B1A1A), fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: _loadNearbyClinics,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              )
+            else if (_clinics.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: Text(
+                  'No clinics found for this area yet.',
+                  style: TextStyle(color: Color(0xFF334155), fontSize: 18),
+                ),
+              )
+            else
+              ...(_selectedSpecialty == null
+                      ? _clinics
+                      : _clinics
+                          .where(
+                            (c) =>
+                                c.name.toLowerCase().contains(_selectedSpecialty!.toLowerCase()) ||
+                                c.category.toLowerCase().contains(_selectedSpecialty!.toLowerCase()),
+                          )
+                          .toList())
+                  .map(
+                (clinic) => Padding(
+                  padding: const EdgeInsets.only(bottom: 14),
+                  child: _ClinicCard(
+                    name: clinic.name,
+                    distance: clinic.distanceLabel,
+                    status: clinic.statusLabel,
+                    category: clinic.category,
+                    address: clinic.address,
+                    onDirections: () => _openDirections(clinic),
+                  ),
                 ),
               ),
-            ),
             const SizedBox(height: 20),
             const Text(
               'SPECIALIZED CARE',
@@ -472,14 +707,24 @@ class ClinicsPage extends StatelessWidget {
   }
 
   Widget _chip(String text) {
+    final isSelected = _selectedSpecialty == text;
     return OutlinedButton(
-      onPressed: () {},
+      onPressed: () => setState(() => _selectedSpecialty = isSelected ? null : text),
       style: OutlinedButton.styleFrom(
+        backgroundColor: isSelected ? const Color(0xFF003366) : null,
         side: const BorderSide(color: Color(0xFF003366), width: 2),
-        foregroundColor: const Color(0xFF003366),
+        foregroundColor: isSelected ? Colors.white : const Color(0xFF003366),
       ),
       child: Text(text),
     );
+  }
+
+  Future<void> _openDirections(_ClinicPlace clinic) async {
+    final uri = Uri.parse(
+      'https://www.google.com/maps/search/?api=1&query=${clinic.latitude},${clinic.longitude}',
+    );
+
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
   }
 }
 
@@ -488,17 +733,17 @@ class _ClinicCard extends StatelessWidget {
     required this.name,
     required this.distance,
     required this.status,
-    required this.price,
-    required this.tag,
-    required this.progress,
+    required this.category,
+    required this.address,
+    required this.onDirections,
   });
 
   final String name;
   final String distance;
   final String status;
-  final String price;
-  final String tag;
-  final double progress;
+  final String category;
+  final String address;
+  final VoidCallback onDirections;
 
   @override
   Widget build(BuildContext context) {
@@ -554,37 +799,70 @@ class _ClinicCard extends StatelessWidget {
             child: Column(
               children: [
                 Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Expanded(
+                    Expanded(
                       child: Text(
-                        'Standard Check-up',
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                        address,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          color: Color(0xFF2B4562),
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ),
-                    Text(
-                      price,
-                      style: const TextStyle(
-                        color: primary,
-                        fontSize: 26,
-                        fontWeight: FontWeight.w700,
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFD5E7FF),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        category,
+                        style: const TextStyle(
+                          color: primary,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 8),
-                LinearProgressIndicator(
-                  value: progress,
-                  minHeight: 8,
-                  color: primary,
-                  backgroundColor: const Color(0xFFD1E3F8),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    const Icon(Icons.access_time, size: 18, color: Color(0xFF2B4562)),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        status,
+                        style: const TextStyle(
+                          color: Color(0xFF2B4562),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: onDirections,
+                      icon: const Icon(Icons.map_outlined),
+                      label: const Text('Directions'),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  tag,
-                  style: const TextStyle(
-                    color: primary,
-                    fontWeight: FontWeight.w700,
-                  ),
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    const Icon(Icons.place, size: 18, color: primary),
+                    const SizedBox(width: 6),
+                    Text(
+                      distance,
+                      style: const TextStyle(
+                        color: primary,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -592,6 +870,186 @@ class _ClinicCard extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+class _ClinicPlace {
+  const _ClinicPlace({
+    required this.name,
+    required this.address,
+    required this.category,
+    required this.distanceMeters,
+    required this.latitude,
+    required this.longitude,
+    this.isOpen,
+  });
+
+  final String name;
+  final String address;
+  final String category;
+  final double distanceMeters;
+  final double latitude;
+  final double longitude;
+  final bool? isOpen;
+
+  String get distanceLabel {
+    final km = distanceMeters / 1000;
+    return km < 1 ? '${distanceMeters.toStringAsFixed(0)} m away' : '${km.toStringAsFixed(1)} km away';
+  }
+
+  String get statusLabel {
+    if (isOpen == true) {
+      return 'Open now';
+    }
+
+    if (isOpen == false) {
+      return 'Currently closed';
+    }
+
+    return 'Hours not listed';
+  }
+}
+
+class _MapPoint {
+  const _MapPoint({required this.latitude, required this.longitude});
+
+  final double latitude;
+  final double longitude;
+}
+
+class _LocationApi {
+  static const _agentHeader = {
+    'User-Agent': 'VisionCare/1.0 (location-finder)',
+  };
+
+  static Future<_MapPoint?> geocodeLocation(String query) async {
+    final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
+      'q': query,
+      'format': 'jsonv2',
+      'limit': '1',
+    });
+
+    final response = await http.get(uri, headers: _agentHeader);
+    if (response.statusCode != 200) {
+      throw Exception('Could not search for location right now.');
+    }
+
+    final data = jsonDecode(response.body);
+    if (data is! List || data.isEmpty) {
+      return null;
+    }
+
+    final top = data.first;
+    final latitude = _numFrom(top['lat']);
+    final longitude = _numFrom(top['lon']);
+    if (latitude == null || longitude == null) {
+      return null;
+    }
+
+    return _MapPoint(latitude: latitude, longitude: longitude);
+  }
+
+  static Future<List<_ClinicPlace>> findNearbyClinics({
+    required double latitude,
+    required double longitude,
+  }) async {
+    final overpassQuery = '''
+[out:json][timeout:25];
+(
+  node["amenity"~"clinic|doctors|hospital|optometrist|ophthalmologist"](around:12000,$latitude,$longitude);
+  way["amenity"~"clinic|doctors|hospital|optometrist|ophthalmologist"](around:12000,$latitude,$longitude);
+  relation["amenity"~"clinic|doctors|hospital|optometrist|ophthalmologist"](around:12000,$latitude,$longitude);
+);
+out center 20;
+''';
+
+    final response = await http.post(
+      Uri.parse('https://overpass-api.de/api/interpreter'),
+      headers: _agentHeader,
+      body: {'data': overpassQuery},
+    );
+
+    if (response.statusCode != 200) {
+      throw Exception('Nearby clinic service is unavailable. Please retry.');
+    }
+
+    final body = jsonDecode(response.body);
+    final elements = body['elements'];
+    if (elements is! List) {
+      return const [];
+    }
+
+    final clinics = <_ClinicPlace>[];
+    for (final element in elements) {
+      if (element is! Map<String, dynamic>) {
+        continue;
+      }
+
+      final tags = element['tags'];
+      if (tags is! Map<String, dynamic>) {
+        continue;
+      }
+
+      final center = element['center'];
+      final lat = _numFrom(element['lat']) ?? (center is Map<String, dynamic> ? _numFrom(center['lat']) : null);
+      final lon = _numFrom(element['lon']) ?? (center is Map<String, dynamic> ? _numFrom(center['lon']) : null);
+      if (lat == null || lon == null) {
+        continue;
+      }
+
+      final distance = Geolocator.distanceBetween(latitude, longitude, lat, lon);
+      final name = (tags['name'] as String?)?.trim();
+      final category = (tags['amenity'] as String?)?.replaceAll('_', ' ') ?? 'Clinic';
+      final address = _formatAddress(tags);
+
+      clinics.add(
+        _ClinicPlace(
+          name: (name == null || name.isEmpty) ? 'Eye care provider' : name,
+          address: address,
+          category: _capitalize(category),
+          distanceMeters: distance,
+          latitude: lat,
+          longitude: lon,
+          isOpen: tags['opening_hours'] != null ? null : null,
+        ),
+      );
+    }
+
+    clinics.sort((a, b) => a.distanceMeters.compareTo(b.distanceMeters));
+    return clinics.take(12).toList(growable: false);
+  }
+
+  static String _formatAddress(Map<String, dynamic> tags) {
+    final house = tags['addr:housenumber'] as String?;
+    final street = tags['addr:street'] as String?;
+    final city = tags['addr:city'] as String?;
+    final area = tags['addr:suburb'] as String?;
+    final parts = [house, street, area, city].whereType<String>().where((part) => part.trim().isNotEmpty).toList();
+    if (parts.isEmpty) {
+      return 'Address not listed';
+    }
+
+    return parts.join(', ');
+  }
+
+  static String _capitalize(String value) {
+    if (value.isEmpty) {
+      return value;
+    }
+
+    return '${value[0].toUpperCase()}${value.substring(1)}';
+  }
+
+  static double? _numFrom(dynamic value) {
+    if (value is num) {
+      return value.toDouble();
+    }
+
+    if (value is String) {
+      return double.tryParse(value);
+    }
+
+    return null;
   }
 }
 
@@ -620,9 +1078,29 @@ class MedicationsPage extends StatelessWidget {
               style: TextStyle(color: Color(0xFF334155), fontSize: 19),
             ),
             const SizedBox(height: 16),
-            const _MedCard(name: 'Latanoprost', schedule: 'Nightly', dose: '1 drop nightly'),
+            _MedCard(
+              name: 'Latanoprost',
+              schedule: 'Nightly',
+              dose: '1 drop nightly',
+              onLog: () => ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('\u2713 Dose logged for Latanoprost')),
+              ),
+              onRefill: () => ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Refill alert set for Latanoprost')),
+              ),
+            ),
             const SizedBox(height: 12),
-            const _MedCard(name: 'Timolol', schedule: 'Twice Daily', dose: '1 drop morning/night'),
+            _MedCard(
+              name: 'Timolol',
+              schedule: 'Twice Daily',
+              dose: '1 drop morning/night',
+              onLog: () => ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('\u2713 Dose logged for Timolol')),
+              ),
+              onRefill: () => ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Refill alert set for Timolol')),
+              ),
+            ),
             const SizedBox(height: 12),
             Container(
               padding: const EdgeInsets.all(18),
@@ -691,7 +1169,14 @@ class MedicationsPage extends StatelessWidget {
                       ],
                     ),
                   ),
-                  FilledButton(onPressed: null, child: Text('Order Now')),
+                  FilledButton(
+                    onPressed: () {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Pharmacy ordering partner coming soon!')),
+                      );
+                    },
+                    child: const Text('Order Now'),
+                  ),
                 ],
               ),
             ),
@@ -703,11 +1188,19 @@ class MedicationsPage extends StatelessWidget {
 }
 
 class _MedCard extends StatelessWidget {
-  const _MedCard({required this.name, required this.schedule, required this.dose});
+  const _MedCard({
+    required this.name,
+    required this.schedule,
+    required this.dose,
+    required this.onLog,
+    required this.onRefill,
+  });
 
   final String name;
   final String schedule;
   final String dose;
+  final VoidCallback onLog;
+  final VoidCallback onRefill;
 
   @override
   Widget build(BuildContext context) {
@@ -772,7 +1265,7 @@ class _MedCard extends StatelessWidget {
               Expanded(
                 child: FilledButton.icon(
                   style: FilledButton.styleFrom(backgroundColor: primary),
-                  onPressed: () {},
+                  onPressed: onLog,
                   icon: const Icon(Icons.check_circle),
                   label: const Text('Log Dose'),
                 ),
@@ -780,7 +1273,7 @@ class _MedCard extends StatelessWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () {},
+                  onPressed: onRefill,
                   icon: const Icon(Icons.notifications_active),
                   label: const Text('Refill Alert'),
                 ),
@@ -793,8 +1286,93 @@ class _MedCard extends StatelessWidget {
   }
 }
 
-class TrackerPage extends StatelessWidget {
+class TrackerPage extends StatefulWidget {
   const TrackerPage({super.key});
+
+  @override
+  State<TrackerPage> createState() => _TrackerPageState();
+}
+
+typedef _Reading = ({String value, String time, bool highlighted, IconData icon});
+
+class _TrackerPageState extends State<TrackerPage> {
+  final List<_Reading> _readings = [
+    (value: '12.1 mmHg', time: 'Today, 08:30 AM', highlighted: false, icon: Icons.water_drop),
+    (value: '14.0 mmHg', time: 'Yesterday, 09:15 PM', highlighted: false, icon: Icons.water_drop),
+    (value: '16.5 mmHg', time: 'Oct 26, 07:45 AM', highlighted: true, icon: Icons.warning),
+    (value: '14.5 mmHg', time: 'Oct 25, 08:20 AM', highlighted: false, icon: Icons.water_drop),
+  ];
+
+  Future<void> _addReading() async {
+    final controller = TextEditingController();
+    final value = await showDialog<String>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('New Pressure Reading'),
+        content: TextField(
+          controller: controller,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(
+            labelText: 'Pressure (mmHg)',
+            hintText: 'e.g. 14',
+            suffixText: 'mmHg',
+          ),
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogCtx, controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (value == null || value.isEmpty || !mounted) return;
+    final num = double.tryParse(value);
+    final isHigh = num != null && num > 21;
+    setState(() {
+      _readings.insert(0, (
+        value: '$value mmHg',
+        time: 'Just now',
+        highlighted: isHigh,
+        icon: isHigh ? Icons.warning : Icons.water_drop,
+      ));
+    });
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Reading of $value mmHg saved.')),
+      );
+    }
+  }
+
+  void _showAllReadings() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (sheetCtx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        builder: (_, controller) => ListView(
+          controller: controller,
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 20),
+          children: [
+            const Text('All Readings', style: TextStyle(color: Color(0xFF002A5C), fontSize: 26, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 14),
+            ..._readings.map((r) => Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _ReadingCard(value: r.value, time: r.time, icon: r.icon, highlighted: r.highlighted),
+            )),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -817,32 +1395,30 @@ class TrackerPage extends StatelessWidget {
                 minimumSize: const Size(double.infinity, 76),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
               ),
-              onPressed: () {},
+              onPressed: _addReading,
               icon: const Icon(Icons.add_circle, size: 34),
               label: const Text('Add New Reading', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700)),
             ),
             const SizedBox(height: 24),
-            const Row(
+            Row(
               children: [
-                Text('Recent Readings', style: TextStyle(color: primary, fontSize: 28, fontWeight: FontWeight.w700)),
-                Spacer(),
-                Text('View All', style: TextStyle(color: primary, fontSize: 20, fontWeight: FontWeight.w600)),
+                const Text('Recent Readings', style: TextStyle(color: primary, fontSize: 28, fontWeight: FontWeight.w700)),
+                const Spacer(),
+                GestureDetector(
+                  onTap: _showAllReadings,
+                  child: const Text(
+                    'View All',
+                    style: TextStyle(color: primary, fontSize: 20, fontWeight: FontWeight.w600, decoration: TextDecoration.underline),
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 12),
-            const _ReadingCard(value: '12.1 mmHg', time: 'Today, 08:30 AM', icon: Icons.water_drop),
-            const SizedBox(height: 12),
-            const _ReadingCard(value: '14.0 mmHg', time: 'Yesterday, 09:15 PM', icon: Icons.water_drop),
-            const SizedBox(height: 12),
-            const _ReadingCard(
-              value: '16.5 mmHg',
-              time: 'Oct 26, 07:45 AM',
-              icon: Icons.warning,
-              highlighted: true,
-            ),
-            const SizedBox(height: 12),
-            const _ReadingCard(value: '14.5 mmHg', time: 'Oct 25, 08:20 AM', icon: Icons.water_drop),
-            const SizedBox(height: 18),
+            ..._readings.take(4).map((r) => Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _ReadingCard(value: r.value, time: r.time, icon: r.icon, highlighted: r.highlighted),
+            )),
+            const SizedBox(height: 6),
             Container(
               height: 220,
               decoration: BoxDecoration(
@@ -1104,12 +1680,109 @@ class _ReadingCard extends StatelessWidget {
   }
 }
 
-class InboxPage extends StatelessWidget {
+class InboxPage extends StatefulWidget {
   const InboxPage({super.key});
+
+  @override
+  State<InboxPage> createState() => _InboxPageState();
+}
+
+class _InboxPageState extends State<InboxPage> {
+  int _tabIndex = 0;
+
+  static const _tabs = ['All Messages', 'Community', 'Alerts'];
+
+  void _openMessage(String title, String body) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: const TextStyle(color: Color(0xFF004A77), fontSize: 22, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 12),
+            Text(body, style: const TextStyle(fontSize: 18, height: 1.4)),
+            const SizedBox(height: 20),
+            FilledButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _composeMessage() {
+    final controller = TextEditingController();
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (sheetCtx) => Padding(
+        padding: EdgeInsets.fromLTRB(24, 24, 24, MediaQuery.of(sheetCtx).viewInsets.bottom + 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('New Message', style: TextStyle(color: Color(0xFF004A77), fontSize: 22, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              maxLines: 4,
+              autofocus: true,
+              decoration: const InputDecoration(
+                hintText: 'Write your message...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: () {
+                    controller.dispose();
+                    Navigator.pop(sheetCtx);
+                  },
+                  child: const Text('Cancel'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: () {
+                    final text = controller.text.trim();
+                    controller.dispose();
+                    Navigator.pop(sheetCtx);
+                    if (text.isNotEmpty) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Message sent!')),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.send),
+                  label: const Text('Send'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     const primary = Color(0xFF004A77);
+
+    // Determine which content cards are visible per tab
+    // Tab 0 = All, Tab 1 = Community, Tab 2 = Alerts/Medical
+    final showGroup = _tabIndex == 0 || _tabIndex == 1;
+    final showSupport = _tabIndex == 0 || _tabIndex == 1;
+    final showMedical = _tabIndex == 0 || _tabIndex == 2;
 
     return SafeArea(
       child: SingleChildScrollView(
@@ -1122,72 +1795,97 @@ class InboxPage extends StatelessWidget {
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
-                children: [
-                  _tab('All Messages', true),
-                  const SizedBox(width: 8),
-                  _tab('Community', false),
-                  const SizedBox(width: 8),
-                  _tab('Alerts', false),
-                ],
+                children: List.generate(_tabs.length, (i) => Padding(
+                  padding: EdgeInsets.only(right: i < _tabs.length - 1 ? 8 : 0),
+                  child: _tab(_tabs[i], i),
+                )),
               ),
             ),
             const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0xFFECF1F6),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFA7B8C8), width: 2),
+            if (showGroup) ...[
+              GestureDetector(
+                onTap: () => _openMessage(
+                  'Support Group (Weekly Q&A)',
+                  'Live discussion starts in 2 hours. Join 45 others discussing eye care and glaucoma management.',
+                ),
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFECF1F6),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFFA7B8C8), width: 2),
+                  ),
+                  child: const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Chip(
+                        label: Text('Featured Group'),
+                        backgroundColor: Color(0xFF005FAF),
+                        labelStyle: TextStyle(color: Colors.white),
+                      ),
+                      SizedBox(height: 6),
+                      Text(
+                        'Support Group (Weekly Q&A)',
+                        style: TextStyle(color: primary, fontSize: 24, fontWeight: FontWeight.w700),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'Live discussion starts in 2 hours. Join 45 others.',
+                        style: TextStyle(color: Color(0xFF4A627A), fontSize: 18),
+                      ),
+                    ],
+                  ),
+                ),
               ),
-              child: const Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Chip(
-                    label: Text('Featured Group'),
-                    backgroundColor: Color(0xFF005FAF),
-                    labelStyle: TextStyle(color: Colors.white),
-                  ),
-                  SizedBox(height: 6),
-                  Text(
-                    'Support Group (Weekly Q&A)',
-                    style: TextStyle(color: primary, fontSize: 24, fontWeight: FontWeight.w700),
-                  ),
-                  SizedBox(height: 4),
-                  Text(
-                    'Live discussion starts in 2 hours. Join 45 others.',
-                    style: TextStyle(color: Color(0xFF4A627A), fontSize: 18),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            const _MessageItem(
-              title: 'Dr. Smith (Follow-up)',
-              time: '10:24 AM',
-              body:
+              const SizedBox(height: 14),
+            ],
+            if (showMedical) ...[
+              GestureDetector(
+                onTap: () => _openMessage(
+                  'Dr. Smith (Follow-up)',
                   'The results from your visual field test look promising. Let\'s discuss your next steps during our call tomorrow.',
-              leadingImage:
-                  'https://lh3.googleusercontent.com/aida-public/AB6AXuD0GDso6a2JbaTFI5jkTZxUCXr19WvmKq6wzUt45C8k6E5HSB7BghWAkxRgRuov-xxT4LCXAIrFXygGgeaYHez_hLHKzA6DtlQe8g0BxY0SMxKB70S88oW_d1eWYooNfV88SmbKBYnteO7a8KIVZD2H3SRoBiOmTQzRjofxYypNoFIJpahc5A0K1D9vYlNJFfRT-JLMEYYR9ueKyrtt89OyZeWw2xcxvXAnHD5cNP4h1RvXtkKtOJ_bSlCOaN9SarYITth8aHYqpuE',
-            ),
-            const SizedBox(height: 10),
-            const _MessageItem(
-              title: 'Care Team (Appointment Confirmed)',
-              time: 'Yesterday',
-              body: 'Your annual eye exam is scheduled for Tuesday, Oct 24 at 9:15 AM at Central Vision Clinic.',
-              icon: Icons.medical_services,
-            ),
-            const SizedBox(height: 10),
-            const _MessageItem(
-              title: 'Support Group (Weekly Q&A)',
-              time: 'Mon',
-              body: 'New topic: Managing light sensitivity at night. What are your best tips for evening walks?',
-              icon: Icons.groups,
-            ),
+                ),
+                child: const _MessageItem(
+                  title: 'Dr. Smith (Follow-up)',
+                  time: '10:24 AM',
+                  body: 'The results from your visual field test look promising. Let\'s discuss your next steps during our call tomorrow.',
+                  leadingImage:
+                      'https://lh3.googleusercontent.com/aida-public/AB6AXuD0GDso6a2JbaTFI5jkTZxUCXr19WvmKq6wzUt45C8k6E5HSB7BghWAkxRgRuov-xxT4LCXAIrFXygGgeaYHez_hLHKzA6DtlQe8g0BxY0SMxKB70S88oW_d1eWYooNfV88SmbKBYnteO7a8KIVZD2H3SRoBiOmTQzRjofxYypNoFIJpahc5A0K1D9vYlNJFfRT-JLMEYYR9ueKyrtt89OyZeWw2xcxvXAnHD5cNP4h1RvXtkKtOJ_bSlCOaN9SarYITth8aHYqpuE',
+                ),
+              ),
+              const SizedBox(height: 10),
+              GestureDetector(
+                onTap: () => _openMessage(
+                  'Care Team (Appointment Confirmed)',
+                  'Your annual eye exam is scheduled for Tuesday, Oct 24 at 9:15 AM at Central Vision Clinic.',
+                ),
+                child: const _MessageItem(
+                  title: 'Care Team (Appointment Confirmed)',
+                  time: 'Yesterday',
+                  body: 'Your annual eye exam is scheduled for Tuesday, Oct 24 at 9:15 AM at Central Vision Clinic.',
+                  icon: Icons.medical_services,
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+            if (showSupport)
+              GestureDetector(
+                onTap: () => _openMessage(
+                  'Support Group (Weekly Q&A)',
+                  'New topic: Managing light sensitivity at night. What are your best tips for evening walks?',
+                ),
+                child: const _MessageItem(
+                  title: 'Support Group (Weekly Q&A)',
+                  time: 'Mon',
+                  body: 'New topic: Managing light sensitivity at night. What are your best tips for evening walks?',
+                  icon: Icons.groups,
+                ),
+              ),
             const SizedBox(height: 16),
             Align(
               alignment: Alignment.centerRight,
               child: FilledButton.icon(
-                onPressed: () {},
+                onPressed: _composeMessage,
                 style: FilledButton.styleFrom(backgroundColor: primary, minimumSize: const Size(180, 60)),
                 icon: const Icon(Icons.edit),
                 label: const Text('New Message', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
@@ -1199,20 +1897,24 @@ class InboxPage extends StatelessWidget {
     );
   }
 
-  Widget _tab(String text, bool selected) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: selected ? const Color(0xFF004A77) : const Color(0xFFECF1F6),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: const Color(0xFFA7B8C8)),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        child: Text(
-          text,
-          style: TextStyle(
-            color: selected ? Colors.white : const Color(0xFF004A77),
-            fontWeight: FontWeight.w600,
+  Widget _tab(String text, int index) {
+    final selected = index == _tabIndex;
+    return GestureDetector(
+      onTap: () => setState(() => _tabIndex = index),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF004A77) : const Color(0xFFECF1F6),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: const Color(0xFFA7B8C8)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Text(
+            text,
+            style: TextStyle(
+              color: selected ? Colors.white : const Color(0xFF004A77),
+              fontWeight: FontWeight.w600,
+            ),
           ),
         ),
       ),
@@ -1319,7 +2021,19 @@ class _TopBar extends StatelessWidget {
             ),
           ),
           IconButton(
-            onPressed: () {},
+            onPressed: () => showDialog<void>(
+              context: context,
+              builder: (_) => AlertDialog(
+                title: const Text('Settings'),
+                content: const Text('Profile and app settings coming soon.'),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Close'),
+                  ),
+                ],
+              ),
+            ),
             icon: const Icon(Icons.settings, color: primary),
           ),
         ],
