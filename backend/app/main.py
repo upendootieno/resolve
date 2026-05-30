@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,14 +8,20 @@ from app.config import get_settings
 from app.database import Base, engine
 from app.routers import auth, appointments, clinics, dose_logs, medications, messages, notifications, patients, pressure
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create all tables against SQLite Cloud on startup
-    with engine.begin() as conn:
-        Base.metadata.create_all(conn)
+    # Attempt table creation — non-fatal so the app starts even if the DB is
+    # temporarily unreachable (tables already exist from development).
+    try:
+        with engine.begin() as conn:
+            Base.metadata.create_all(conn)
+        logger.info("Database tables verified/created.")
+    except Exception as exc:
+        logger.warning("DB startup check failed (continuing anyway): %s", exc)
     yield
 
 
@@ -53,4 +60,9 @@ app.include_router(notifications.router, prefix=PREFIX)
 
 @app.get(f"{PREFIX}/health", tags=["health"])
 async def health() -> dict:
-    return {"status": "ok"}
+    try:
+        with engine.connect():
+            pass
+        return {"status": "ok", "db": "connected"}
+    except Exception as exc:
+        return {"status": "ok", "db": "unreachable", "detail": str(exc)}
