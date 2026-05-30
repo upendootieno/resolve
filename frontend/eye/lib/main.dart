@@ -1,28 +1,124 @@
-import 'dart:convert';
+﻿import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
-void main() {
+// ── Push / local notification helper ─────────────────────────────────────────
+class _AppNotifications {
+  static final _plugin = FlutterLocalNotificationsPlugin();
+
+  static Future<void> init() async {
+    const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const ios = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+    await _plugin.initialize(settings: const InitializationSettings(android: android, iOS: ios));
+    await _plugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+  }
+
+  static Future<void> send(String title, String body) async {
+    const androidDetails = AndroidNotificationDetails(
+      'eye_resolve',
+      'Eye Resolve Alerts',
+      channelDescription: 'Health reminders and alerts from Eye Resolve',
+      importance: Importance.high,
+      priority: Priority.high,
+    );
+    await _plugin.show(
+      id: DateTime.now().millisecondsSinceEpoch & 0x7FFFFFFF,
+      title: title,
+      body: body,
+      notificationDetails: const NotificationDetails(android: androidDetails, iOS: DarwinNotificationDetails()),
+    );
+  }
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await _AppNotifications.init();
   runApp(const EyeApp());
 }
 
-class EyeApp extends StatelessWidget {
+class EyeApp extends StatefulWidget {
   const EyeApp({super.key});
 
   @override
+  State<EyeApp> createState() => _EyeAppState();
+}
+
+// ── Persistent app settings (in-memory; survives widget rebuilds) ─────────────
+class _AppSettings {
+  const _AppSettings({
+    this.primaryColor = const Color(0xFF003366),
+    this.fontScale = 1.0,
+    this.phoneNumber = '',
+    this.patientName = 'Patient',
+    this.isLoggedIn = true,
+  });
+
+  final Color primaryColor;
+  final double fontScale;
+  final String phoneNumber;
+  final String patientName;
+  final bool isLoggedIn;
+
+  _AppSettings copyWith({
+    Color? primaryColor,
+    double? fontScale,
+    String? phoneNumber,
+    String? patientName,
+    bool? isLoggedIn,
+  }) =>
+      _AppSettings(
+        primaryColor: primaryColor ?? this.primaryColor,
+        fontScale: fontScale ?? this.fontScale,
+        phoneNumber: phoneNumber ?? this.phoneNumber,
+        patientName: patientName ?? this.patientName,
+        isLoggedIn: isLoggedIn ?? this.isLoggedIn,
+      );
+}
+
+final _settingsNotifier = ValueNotifier<_AppSettings>(const _AppSettings());
+
+class _EyeAppState extends State<EyeApp> {
+  @override
+  void initState() {
+    super.initState();
+    _settingsNotifier.addListener(_rebuild);
+  }
+
+  @override
+  void dispose() {
+    _settingsNotifier.removeListener(_rebuild);
+    super.dispose();
+  }
+
+  void _rebuild() => setState(() {});
+
+  @override
   Widget build(BuildContext context) {
+    final s = _settingsNotifier.value;
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Eye Resolve',
       theme: ThemeData(
         useMaterial3: true,
         scaffoldBackgroundColor: const Color(0xFFF0F4F8),
-        fontFamily: 'Atkinson Hyperlegible Next',
+        colorSchemeSeed: s.primaryColor,
       ),
-      home: const MainShell(),
+      // Apply font scale globally via MediaQuery so every Text respects it
+      builder: (ctx, child) => MediaQuery(
+        data: MediaQuery.of(ctx).copyWith(textScaler: TextScaler.linear(s.fontScale)),
+        child: child!,
+      ),
+      home: s.isLoggedIn ? const MainShell() : const _LoginPage(),
     );
   }
 }
@@ -67,12 +163,12 @@ class _BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const primary = Color(0xFF003366);
+    final primary = Theme.of(context).colorScheme.primary;
     const muted = Color(0xFF4A627A);
 
     return Container(
       height: 88,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: Colors.white,
         border: Border(top: BorderSide(color: primary, width: 3)),
       ),
@@ -180,12 +276,15 @@ class HomeDashboardPage extends StatelessWidget {
           children: [
             const _TopBar(title: 'Eye Resolve'),
             const SizedBox(height: 22),
-            const Text(
-              'Good morning, Patient',
-              style: TextStyle(
-                color: primary,
-                fontSize: 32,
-                fontWeight: FontWeight.w700,
+            ValueListenableBuilder<_AppSettings>(
+              valueListenable: _settingsNotifier,
+              builder: (_, s, _) => Text(
+                'Good morning, ${s.patientName}',
+                style: TextStyle(
+                  color: primary,
+                  fontSize: 32,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
             const SizedBox(height: 8),
@@ -406,11 +505,24 @@ class ClinicsPage extends StatefulWidget {
 class _ClinicsPageState extends State<ClinicsPage> {
   final TextEditingController _searchController = TextEditingController();
 
+  // Eye clinics state
   List<_ClinicPlace> _clinics = const [];
   bool _isLoading = false;
   String? _errorMessage;
   String _locationLabel = 'your location';
   String? _selectedSpecialty;
+
+  // Pharmacies state
+  List<_PharmacyPlace> _pharmacies = const [];
+  bool _isLoadingPharmacies = false;
+  String? _pharmacyError;
+
+  // 0 = Eye Clinics, 1 = Pharmacies
+  int _subTab = 0;
+
+  // Cache last resolved coordinates
+  double? _lastLat;
+  double? _lastLon;
 
   @override
   void initState() {
@@ -430,31 +542,35 @@ class _ClinicsPageState extends State<ClinicsPage> {
       _errorMessage = null;
       _locationLabel = 'your location';
     });
-
     try {
-      final position = await _resolveCurrentPosition();
-      final clinics = await _LocationApi.findNearbyClinics(
-        latitude: position.latitude,
-        longitude: position.longitude,
-      );
+      final pos = await _resolveCurrentPosition();
+      _lastLat = pos.latitude;
+      _lastLon = pos.longitude;
+      final clinics = await _LocationApi.findNearbyEyeClinics(latitude: pos.latitude, longitude: pos.longitude);
+      if (!mounted) return;
+      setState(() { _clinics = clinics; _isLoading = false; });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _isLoading = false; _errorMessage = e.toString().replaceFirst('Exception: ', ''); });
+    }
+  }
 
-      if (!mounted) {
-        return;
+  Future<void> _loadNearbyPharmacies() async {
+    setState(() { _isLoadingPharmacies = true; _pharmacyError = null; });
+    try {
+      double? lat = _lastLat;
+      double? lon = _lastLon;
+      if (lat == null || lon == null) {
+        final pos = await _resolveCurrentPosition();
+        _lastLat = lat = pos.latitude;
+        _lastLon = lon = pos.longitude;
       }
-
-      setState(() {
-        _clinics = clinics;
-        _isLoading = false;
-      });
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isLoading = false;
-        _errorMessage = error.toString().replaceFirst('Exception: ', '');
-      });
+      final pharmacies = await _LocationApi.findNearbyPharmacies(latitude: lat, longitude: lon);
+      if (!mounted) return;
+      setState(() { _pharmacies = pharmacies; _isLoadingPharmacies = false; });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _isLoadingPharmacies = false; _pharmacyError = e.toString().replaceFirst('Exception: ', ''); });
     }
   }
 
@@ -464,67 +580,151 @@ class _ClinicsPageState extends State<ClinicsPage> {
       await _loadNearbyClinics();
       return;
     }
-
-    setState(() {
-      _isLoading = true;
-      _errorMessage = null;
-    });
-
+    setState(() { _isLoading = true; _isLoadingPharmacies = true; _errorMessage = null; _pharmacyError = null; });
     try {
       final target = await _LocationApi.geocodeLocation(query);
-      if (target == null) {
-        throw Exception('No matching location found for "$query".');
-      }
-
-      final clinics = await _LocationApi.findNearbyClinics(
-        latitude: target.latitude,
-        longitude: target.longitude,
-      );
-
-      if (!mounted) {
-        return;
-      }
-
+      if (target == null) throw Exception('No matching location found for "$query".');
+      _lastLat = target.latitude;
+      _lastLon = target.longitude;
+      final clinics = await _LocationApi.findNearbyEyeClinics(latitude: target.latitude, longitude: target.longitude);
+      final pharmacies = await _LocationApi.findNearbyPharmacies(latitude: target.latitude, longitude: target.longitude);
+      if (!mounted) return;
       setState(() {
         _locationLabel = query;
         _clinics = clinics;
+        _pharmacies = pharmacies;
         _isLoading = false;
+        _isLoadingPharmacies = false;
       });
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isLoading = false;
-        _errorMessage = error.toString().replaceFirst('Exception: ', '');
-      });
+    } catch (e) {
+      if (!mounted) return;
+      final msg = e.toString().replaceFirst('Exception: ', '');
+      setState(() { _isLoading = false; _isLoadingPharmacies = false; _errorMessage = msg; _pharmacyError = msg; });
     }
   }
 
   Future<Position> _resolveCurrentPosition() async {
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
+    if (!await Geolocator.isLocationServiceEnabled()) {
       throw Exception('Location services are off. Please enable GPS and retry.');
     }
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
+    if (perm == LocationPermission.denied) throw Exception('Location permission denied.');
+    if (perm == LocationPermission.deniedForever) throw Exception('Location permission denied forever. Update it in Settings.');
+    return Geolocator.getCurrentPosition(locationSettings: const LocationSettings(accuracy: LocationAccuracy.high));
+  }
 
-    var permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-
-    if (permission == LocationPermission.denied) {
-      throw Exception('Location permission denied.');
-    }
-
-    if (permission == LocationPermission.deniedForever) {
-      throw Exception('Location permission denied forever. Update it in settings.');
-    }
-
-    return Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+  void _showClinicDetail(_ClinicPlace clinic) {
+    const primary = Color(0xFF003366);
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (_) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.55,
+        maxChildSize: 0.92,
+        builder: (_, controller) => SingleChildScrollView(
+          controller: controller,
+          padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40, height: 4,
+                  margin: const EdgeInsets.only(bottom: 16),
+                  decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(99)),
+                ),
+              ),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Text(clinic.name, style: const TextStyle(color: primary, fontSize: 22, fontWeight: FontWeight.w800)),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    decoration: BoxDecoration(color: const Color(0xFFD5E7FF), borderRadius: BorderRadius.circular(999)),
+                    child: Text(clinic.category, style: const TextStyle(color: primary, fontWeight: FontWeight.w700, fontSize: 13)),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              _detailRow(Icons.place, clinic.distanceLabel, primary),
+              const SizedBox(height: 6),
+              _detailRow(
+                Icons.access_time,
+                clinic.statusLabel,
+                clinic.statusLabel == 'Open now' ? Colors.green.shade700 : primary,
+              ),
+              if (clinic.address != 'Address not listed') ...[
+                const SizedBox(height: 6),
+                _detailRow(Icons.home_work, clinic.address, primary),
+              ],
+              if (clinic.openingHoursRaw != null) ...[
+                const SizedBox(height: 6),
+                _detailRow(Icons.schedule, clinic.openingHoursRaw!, primary),
+              ],
+              if (clinic.phone != null) ...[
+                const SizedBox(height: 6),
+                _detailRow(Icons.phone, clinic.phone!, primary),
+              ],
+              if (clinic.website != null) ...[
+                const SizedBox(height: 6),
+                _detailRow(Icons.language, clinic.website!, primary),
+              ],
+              const SizedBox(height: 22),
+              const Divider(),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: () => _openDirections(clinic),
+                style: FilledButton.styleFrom(
+                  backgroundColor: primary,
+                  minimumSize: const Size(double.infinity, 52),
+                ),
+                icon: const Icon(Icons.directions),
+                label: const Text('Get Directions', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+              ),
+              if (clinic.phone != null) ...[
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
+                  onPressed: () => launchUrl(Uri.parse('tel:${clinic.phone}')),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size(double.infinity, 52),
+                    side: const BorderSide(color: primary, width: 2),
+                  ),
+                  icon: const Icon(Icons.call, color: primary),
+                  label: const Text('Call Clinic', style: TextStyle(color: primary, fontSize: 16, fontWeight: FontWeight.w700)),
+                ),
+              ],
+              if (clinic.website != null) ...[
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
+                  onPressed: () => launchUrl(Uri.parse(clinic.website!), mode: LaunchMode.externalApplication),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size(double.infinity, 52),
+                    side: const BorderSide(color: primary, width: 2),
+                  ),
+                  icon: const Icon(Icons.language, color: primary),
+                  label: const Text('Visit Website', style: TextStyle(color: primary, fontSize: 16, fontWeight: FontWeight.w700)),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
+
+  Widget _detailRow(IconData icon, String text, Color color) => Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: color),
+          const SizedBox(width: 8),
+          Expanded(child: Text(text, style: TextStyle(color: color, fontSize: 15, fontWeight: FontWeight.w600))),
+        ],
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -537,33 +737,39 @@ class _ClinicsPageState extends State<ClinicsPage> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             const _TopBar(title: 'Clinics'),
-            const SizedBox(height: 22),
+            const SizedBox(height: 14),
+            // ── Sub-tab switcher ──
+            Row(
+              children: [
+                _subTabBtn('Eye Clinics', 0, Icons.remove_red_eye, primary),
+                const SizedBox(width: 10),
+                _subTabBtn('Pharmacies', 1, Icons.local_pharmacy, primary),
+              ],
+            ),
+            const SizedBox(height: 14),
             TextField(
               controller: _searchController,
               textInputAction: TextInputAction.search,
               onSubmitted: (_) => _searchLocation(),
               decoration: InputDecoration(
-                prefixIcon: const Icon(Icons.search, size: 30, color: primary),
+                prefixIcon: const Icon(Icons.search, size: 28, color: primary),
                 suffixIcon: IconButton(
                   onPressed: _searchLocation,
                   icon: const Icon(Icons.travel_explore, color: primary),
                 ),
-                hintText: 'Search a town or address',
+                hintText: _subTab == 0
+                    ? 'Search town or address for eye clinics'
+                    : 'Search town or address for pharmacies',
                 filled: true,
                 fillColor: Colors.white,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  borderSide: const BorderSide(color: primary, width: 3),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  borderSide: const BorderSide(color: primary, width: 3),
-                ),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: const BorderSide(color: primary, width: 3)),
+                enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: const BorderSide(color: primary, width: 3)),
               ),
             ),
-            const SizedBox(height: 18),
+            const SizedBox(height: 14),
+            // ── Map banner ──
             Container(
-              height: 200,
+              height: 160,
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(color: primary, width: 3),
@@ -574,133 +780,180 @@ class _ClinicsPageState extends State<ClinicsPage> {
                 ),
               ),
               child: Padding(
-                padding: const EdgeInsets.all(20),
+                padding: const EdgeInsets.all(18),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    const Text(
-                      'Live Search Area',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 24,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
                     Text(
-                      'Showing clinics near $_locationLabel',
-                      style: const TextStyle(
-                        color: Color(0xFFD2E9FF),
-                        fontSize: 17,
-                        fontWeight: FontWeight.w600,
-                      ),
+                      _subTab == 0 ? 'Eye Clinics Near You' : 'Pharmacies Near You',
+                      style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800),
                     ),
-                    const SizedBox(height: 14),
-                    Row(
+                    const SizedBox(height: 4),
+                    Text('Showing results near $_locationLabel',
+                        style: const TextStyle(color: Color(0xFFD2E9FF), fontSize: 14, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 12),
+                    FilledButton.icon(
+                      onPressed: () {
+                        _loadNearbyClinics();
+                        if (_subTab == 1) _loadNearbyPharmacies();
+                      },
+                      style: FilledButton.styleFrom(backgroundColor: Colors.white),
+                      icon: const Icon(Icons.my_location, color: primary, size: 18),
+                      label: const Text('Use My Location', style: TextStyle(color: primary)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            // ═══════════════════════════════════════
+            // EYE CLINICS TAB
+            // ═══════════════════════════════════════
+            if (_subTab == 0) ...[
+              const Text('Eye Clinics',
+                  style: TextStyle(color: primary, fontSize: 28, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 4),
+              const Text('Tap a clinic for full details, directions and contact info.',
+                  style: TextStyle(color: Color(0xFF4A627A), fontSize: 14)),
+              const SizedBox(height: 12),
+              if (_isLoading)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 36),
+                  child: Center(child: CircularProgressIndicator(color: primary)),
+                )
+              else if (_errorMessage != null)
+                _errorWidget(_errorMessage!, _loadNearbyClinics, primary)
+              else if (_clinics.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    'No eye clinics found nearby. Try a wider search or different area.',
+                    style: TextStyle(color: Color(0xFF334155), fontSize: 17),
+                  ),
+                )
+              else
+                ...(_selectedSpecialty == null
+                        ? _clinics
+                        : _clinics
+                            .where((c) =>
+                                c.name.toLowerCase().contains(_selectedSpecialty!.toLowerCase()) ||
+                                c.category.toLowerCase().contains(_selectedSpecialty!.toLowerCase()))
+                            .toList())
+                    .map((clinic) => Padding(
+                          padding: const EdgeInsets.only(bottom: 14),
+                          child: _ClinicCard(
+                            name: clinic.name,
+                            distance: clinic.distanceLabel,
+                            status: clinic.statusLabel,
+                            category: clinic.category,
+                            address: clinic.address,
+                            onDirections: () => _openDirections(clinic),
+                            onTap: () => _showClinicDetail(clinic),
+                          ),
+                        )),
+              const SizedBox(height: 20),
+              const Text('SPECIALIZED CARE',
+                  style: TextStyle(color: primary, letterSpacing: 2.5, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  _chip('Cataracts'),
+                  _chip('Glaucoma'),
+                  _chip('Optometry'),
+                  _chip('Retina'),
+                ],
+              ),
+            ],
+
+            // ═══════════════════════════════════════
+            // PHARMACIES TAB
+            // ═══════════════════════════════════════
+            if (_subTab == 1) ...[
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text('Nearest Pharmacies',
+                        style: TextStyle(color: primary, fontSize: 28, fontWeight: FontWeight.w700)),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    decoration: BoxDecoration(color: const Color(0xFFD5E7FF), borderRadius: BorderRadius.circular(999)),
+                    child: const Row(
                       children: [
-                        FilledButton.icon(
-                          onPressed: _loadNearbyClinics,
-                          style: FilledButton.styleFrom(backgroundColor: Colors.white),
-                          icon: const Icon(Icons.my_location, color: primary),
-                          label: const Text('Use My Location', style: TextStyle(color: primary)),
-                        ),
+                        Icon(Icons.sort, size: 16, color: primary),
+                        SizedBox(width: 4),
+                        Text('Closest first', style: TextStyle(color: primary, fontSize: 13, fontWeight: FontWeight.w700)),
                       ],
                     ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 22),
-            Text(
-              'Nearby Recommendations',
-              style: const TextStyle(
-                color: primary,
-                fontSize: 30,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: 12),
-            if (_isLoading)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 36),
-                child: Center(child: CircularProgressIndicator(color: primary)),
-              )
-            else if (_errorMessage != null)
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: const Color(0xFFE49898), width: 2),
-                ),
-                child: Column(
-                  children: [
-                    Text(
-                      _errorMessage!,
-                      style: const TextStyle(color: Color(0xFF7B1A1A), fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 12),
-                    OutlinedButton.icon(
-                      onPressed: _loadNearbyClinics,
-                      icon: const Icon(Icons.refresh),
-                      label: const Text('Retry'),
-                    ),
-                  ],
-                ),
-              )
-            else if (_clinics.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 12),
-                child: Text(
-                  'No clinics found for this area yet.',
-                  style: TextStyle(color: Color(0xFF334155), fontSize: 18),
-                ),
-              )
-            else
-              ...(_selectedSpecialty == null
-                      ? _clinics
-                      : _clinics
-                          .where(
-                            (c) =>
-                                c.name.toLowerCase().contains(_selectedSpecialty!.toLowerCase()) ||
-                                c.category.toLowerCase().contains(_selectedSpecialty!.toLowerCase()),
-                          )
-                          .toList())
-                  .map(
-                (clinic) => Padding(
-                  padding: const EdgeInsets.only(bottom: 14),
-                  child: _ClinicCard(
-                    name: clinic.name,
-                    distance: clinic.distanceLabel,
-                    status: clinic.statusLabel,
-                    category: clinic.category,
-                    address: clinic.address,
-                    onDirections: () => _openDirections(clinic),
                   ),
-                ),
+                ],
               ),
-            const SizedBox(height: 20),
-            const Text(
-              'SPECIALIZED CARE',
-              style: TextStyle(
-                color: primary,
-                letterSpacing: 2.5,
-                fontWeight: FontWeight.w800,
+              const SizedBox(height: 4),
+              const Text(
+                'Sorted by distance. Tap a pharmacy to get directions or call.',
+                style: TextStyle(color: Color(0xFF4A627A), fontSize: 14),
               ),
-            ),
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                _chip('Cataracts'),
-                _chip('Glaucoma'),
-                _chip('Optometry'),
-                _chip('Retina'),
-              ],
-            ),
+              const SizedBox(height: 12),
+              if (_isLoadingPharmacies)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 36),
+                  child: Center(child: CircularProgressIndicator(color: primary)),
+                )
+              else if (_pharmacyError != null)
+                _errorWidget(_pharmacyError!, _loadNearbyPharmacies, primary)
+              else if (_pharmacies.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    'No pharmacies found nearby. Try searching a different area.',
+                    style: TextStyle(color: Color(0xFF334155), fontSize: 17),
+                  ),
+                )
+              else
+                ..._pharmacies.map((p) => Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: _PharmacyCard(pharmacy: p),
+                    )),
+            ],
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _subTabBtn(String label, int index, IconData icon, Color primary) {
+    final sel = _subTab == index;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () {
+          setState(() => _subTab = index);
+          if (index == 1 && _pharmacies.isEmpty && !_isLoadingPharmacies) {
+            _loadNearbyPharmacies();
+          }
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            color: sel ? primary : Colors.white,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: primary, width: 2),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: sel ? Colors.white : primary, size: 20),
+              const SizedBox(width: 6),
+              Text(label,
+                  style: TextStyle(
+                      color: sel ? Colors.white : primary,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 15)),
+            ],
+          ),
         ),
       ),
     );
@@ -719,11 +972,25 @@ class _ClinicsPageState extends State<ClinicsPage> {
     );
   }
 
+  Widget _errorWidget(String message, VoidCallback onRetry, Color primary) => Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFFE49898), width: 2),
+        ),
+        child: Column(
+          children: [
+            Text(message, style: const TextStyle(color: Color(0xFF7B1A1A), fontWeight: FontWeight.w600)),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(onPressed: onRetry, icon: const Icon(Icons.refresh), label: const Text('Retry')),
+          ],
+        ),
+      );
+
   Future<void> _openDirections(_ClinicPlace clinic) async {
     final uri = Uri.parse(
-      'https://www.google.com/maps/search/?api=1&query=${clinic.latitude},${clinic.longitude}',
-    );
-
+        'https://www.google.com/maps/search/?api=1&query=${clinic.latitude},${clinic.longitude}');
     await launchUrl(uri, mode: LaunchMode.externalApplication);
   }
 }
@@ -736,6 +1003,7 @@ class _ClinicCard extends StatelessWidget {
     required this.category,
     required this.address,
     required this.onDirections,
+    required this.onTap,
   });
 
   final String name;
@@ -744,18 +1012,22 @@ class _ClinicCard extends StatelessWidget {
   final String category;
   final String address;
   final VoidCallback onDirections;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     const primary = Color(0xFF003366);
 
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFA3C4F3), width: 3),
-      ),
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFFA3C4F3), width: 3),
+        ),
       child: Column(
         children: [
           Row(
@@ -869,6 +1141,83 @@ class _ClinicCard extends StatelessWidget {
           ),
         ],
       ),
+    ),
+    );
+  }
+}
+
+class _PharmacyCard extends StatelessWidget {
+  const _PharmacyCard({required this.pharmacy});
+
+  final _PharmacyPlace pharmacy;
+
+  @override
+  Widget build(BuildContext context) {
+    const primary = Color(0xFF003366);
+    return InkWell(
+      onTap: () async {
+        final uri = Uri.parse(
+            'https://www.google.com/maps/search/?api=1&query=${pharmacy.latitude},${pharmacy.longitude}');
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      },
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFFA3C4F3), width: 2),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 50,
+              height: 50,
+              decoration: BoxDecoration(
+                color: const Color(0xFFD5E7FF),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Icon(Icons.local_pharmacy, color: primary, size: 28),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(pharmacy.name,
+                      style: const TextStyle(color: primary, fontSize: 18, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 2),
+                  Text(pharmacy.address,
+                      style: const TextStyle(color: Color(0xFF4A627A), fontSize: 14)),
+                  if (pharmacy.openingHoursRaw != null) ...[
+                    const SizedBox(height: 2),
+                    Text(pharmacy.openingHoursRaw!,
+                        style: const TextStyle(color: Color(0xFF4A627A), fontSize: 13)),
+                  ],
+                  if (pharmacy.phone != null) ...[
+                    const SizedBox(height: 2),
+                    Row(children: [
+                      const Icon(Icons.phone, size: 14, color: Color(0xFF4A627A)),
+                      const SizedBox(width: 4),
+                      Text(pharmacy.phone!,
+                          style: const TextStyle(color: Color(0xFF4A627A), fontSize: 13)),
+                    ]),
+                  ],
+                ],
+              ),
+            ),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(pharmacy.distanceLabel,
+                    style: const TextStyle(color: primary, fontWeight: FontWeight.w700, fontSize: 14)),
+                const SizedBox(height: 6),
+                const Icon(Icons.directions, color: primary, size: 22),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -882,6 +1231,9 @@ class _ClinicPlace {
     required this.latitude,
     required this.longitude,
     this.isOpen,
+    this.phone,
+    this.website,
+    this.openingHoursRaw,
   });
 
   final String name;
@@ -891,6 +1243,9 @@ class _ClinicPlace {
   final double latitude;
   final double longitude;
   final bool? isOpen;
+  final String? phone;
+  final String? website;
+  final String? openingHoursRaw;
 
   String get distanceLabel {
     final km = distanceMeters / 1000;
@@ -915,6 +1270,33 @@ class _MapPoint {
 
   final double latitude;
   final double longitude;
+}
+
+class _PharmacyPlace {
+  const _PharmacyPlace({
+    required this.name,
+    required this.address,
+    required this.distanceMeters,
+    required this.latitude,
+    required this.longitude,
+    this.phone,
+    this.openingHoursRaw,
+  });
+
+  final String name;
+  final String address;
+  final double distanceMeters;
+  final double latitude;
+  final double longitude;
+  final String? phone;
+  final String? openingHoursRaw;
+
+  String get distanceLabel {
+    final km = distanceMeters / 1000;
+    return km < 1
+        ? '${distanceMeters.toStringAsFixed(0)} m away'
+        : '${km.toStringAsFixed(1)} km away';
+  }
 }
 
 class _LocationApi {
@@ -949,16 +1331,21 @@ class _LocationApi {
     return _MapPoint(latitude: latitude, longitude: longitude);
   }
 
-  static Future<List<_ClinicPlace>> findNearbyClinics({
+  static Future<List<_ClinicPlace>> findNearbyEyeClinics({
     required double latitude,
     required double longitude,
   }) async {
     final overpassQuery = '''
 [out:json][timeout:25];
 (
-  node["amenity"~"clinic|doctors|hospital|optometrist|ophthalmologist"](around:12000,$latitude,$longitude);
-  way["amenity"~"clinic|doctors|hospital|optometrist|ophthalmologist"](around:12000,$latitude,$longitude);
-  relation["amenity"~"clinic|doctors|hospital|optometrist|ophthalmologist"](around:12000,$latitude,$longitude);
+  node["amenity"~"optometrist|ophthalmologist"](around:15000,$latitude,$longitude);
+  way["amenity"~"optometrist|ophthalmologist"](around:15000,$latitude,$longitude);
+  relation["amenity"~"optometrist|ophthalmologist"](around:15000,$latitude,$longitude);
+  node["healthcare"~"optometrist|ophthalmologist"](around:15000,$latitude,$longitude);
+  way["healthcare"~"optometrist|ophthalmologist"](around:15000,$latitude,$longitude);
+  node["amenity"~"clinic|hospital"]["name"~"eye|vision|optic|ophthal|retina|glaucoma",i](around:15000,$latitude,$longitude);
+  way["amenity"~"clinic|hospital"]["name"~"eye|vision|optic|ophthal|retina|glaucoma",i](around:15000,$latitude,$longitude);
+  relation["amenity"~"clinic|hospital"]["name"~"eye|vision|optic|ophthal|retina|glaucoma",i](around:15000,$latitude,$longitude);
 );
 out center 20;
 ''';
@@ -1011,6 +1398,9 @@ out center 20;
           latitude: lat,
           longitude: lon,
           isOpen: tags['opening_hours'] != null ? null : null,
+          phone: tags['phone'] as String? ?? tags['contact:phone'] as String?,
+          website: tags['website'] as String? ?? tags['contact:website'] as String?,
+          openingHoursRaw: tags['opening_hours'] as String?,
         ),
       );
     }
@@ -1051,6 +1441,62 @@ out center 20;
 
     return null;
   }
+
+  static Future<List<_PharmacyPlace>> findNearbyPharmacies({
+    required double latitude,
+    required double longitude,
+  }) async {
+    final overpassQuery = '''
+[out:json][timeout:25];
+(
+  node["amenity"="pharmacy"](around:10000,$latitude,$longitude);
+  way["amenity"="pharmacy"](around:10000,$latitude,$longitude);
+);
+out center 15;
+''';
+
+    final response = await http.post(
+      Uri.parse('https://overpass-api.de/api/interpreter'),
+      headers: _agentHeader,
+      body: {'data': overpassQuery},
+    );
+
+    if (response.statusCode != 200) {
+      throw Exception('Pharmacy search is unavailable. Please retry.');
+    }
+
+    final body = jsonDecode(response.body);
+    final elements = body['elements'];
+    if (elements is! List) return const [];
+
+    final pharmacies = <_PharmacyPlace>[];
+    for (final element in elements) {
+      if (element is! Map<String, dynamic>) continue;
+      final tags = element['tags'];
+      if (tags is! Map<String, dynamic>) continue;
+
+      final center = element['center'];
+      final lat = _numFrom(element['lat']) ?? (center is Map<String, dynamic> ? _numFrom(center['lat']) : null);
+      final lon = _numFrom(element['lon']) ?? (center is Map<String, dynamic> ? _numFrom(center['lon']) : null);
+      if (lat == null || lon == null) continue;
+
+      final distance = Geolocator.distanceBetween(latitude, longitude, lat, lon);
+      final name = (tags['name'] as String?)?.trim();
+
+      pharmacies.add(_PharmacyPlace(
+        name: (name == null || name.isEmpty) ? 'Pharmacy' : name,
+        address: _formatAddress(tags),
+        distanceMeters: distance,
+        latitude: lat,
+        longitude: lon,
+        phone: tags['phone'] as String? ?? tags['contact:phone'] as String?,
+        openingHoursRaw: tags['opening_hours'] as String?,
+      ));
+    }
+
+    pharmacies.sort((a, b) => a.distanceMeters.compareTo(b.distanceMeters));
+    return pharmacies.take(15).toList(growable: false);
+  }
 }
 
 class MedicationsPage extends StatelessWidget {
@@ -1082,24 +1528,36 @@ class MedicationsPage extends StatelessWidget {
               name: 'Latanoprost',
               schedule: 'Nightly',
               dose: '1 drop nightly',
-              onLog: () => ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('\u2713 Dose logged for Latanoprost')),
-              ),
-              onRefill: () => ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Refill alert set for Latanoprost')),
-              ),
+              onLog: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('\u2713 Dose logged for Latanoprost')),
+                );
+                _AppNotifications.send('Dose Logged \u2713', 'Latanoprost dose recorded. Keep up the routine!');
+              },
+              onRefill: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Refill alert set for Latanoprost')),
+                );
+                _AppNotifications.send('Refill Reminder Set', 'You will be reminded to refill Latanoprost. Approx. 4 days remaining.');
+              },
             ),
             const SizedBox(height: 12),
             _MedCard(
               name: 'Timolol',
               schedule: 'Twice Daily',
               dose: '1 drop morning/night',
-              onLog: () => ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('\u2713 Dose logged for Timolol')),
-              ),
-              onRefill: () => ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Refill alert set for Timolol')),
-              ),
+              onLog: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('\u2713 Dose logged for Timolol')),
+                );
+                _AppNotifications.send('Dose Logged \u2713', 'Timolol dose recorded. Keep up the routine!');
+              },
+              onRefill: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Refill alert set for Timolol')),
+                );
+                _AppNotifications.send('Refill Reminder Set', 'You will be reminded to refill Timolol.');
+              },
             ),
             const SizedBox(height: 12),
             Container(
@@ -1347,6 +1805,12 @@ class _TrackerPageState extends State<TrackerPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Reading of $value mmHg saved.')),
       );
+      if (isHigh) {
+        _AppNotifications.send(
+          '\u26a0 High Eye Pressure Detected',
+          'Your reading of $value mmHg exceeds the normal range (\u226421 mmHg). Please contact your doctor.',
+        );
+      }
     }
   }
 
@@ -1994,6 +2458,517 @@ class _MessageItem extends StatelessWidget {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// SETTINGS PAGE
+// ══════════════════════════════════════════════════════════════════════════════
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  late final TextEditingController _nameCtrl;
+  late final TextEditingController _phoneCtrl;
+
+  static const _colorOptions = [
+    (label: 'Navy', color: Color(0xFF003366)),
+    (label: 'Blue', color: Color(0xFF1565C0)),
+    (label: 'Green', color: Color(0xFF2E7D32)),
+    (label: 'Purple', color: Color(0xFF6A1B9A)),
+    (label: 'Teal', color: Color(0xFF00695C)),
+    (label: 'Red', color: Color(0xFFC62828)),
+  ];
+
+  static const _fontScales = [
+    (label: 'S', scale: 0.85),
+    (label: 'M', scale: 1.0),
+    (label: 'L', scale: 1.15),
+    (label: 'XL', scale: 1.3),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _nameCtrl = TextEditingController(text: _settingsNotifier.value.patientName);
+    _phoneCtrl = TextEditingController(text: _settingsNotifier.value.phoneNumber);
+  }
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    _phoneCtrl.dispose();
+    super.dispose();
+  }
+
+  void _update(_AppSettings Function(_AppSettings) fn) {
+    _settingsNotifier.value = fn(_settingsNotifier.value);
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = _settingsNotifier.value;
+    final primary = Theme.of(context).colorScheme.primary;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF0F4F8),
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 0,
+        leading: IconButton(
+          icon: Icon(Icons.arrow_back, color: primary),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text(
+          'Settings',
+          style: TextStyle(color: primary, fontWeight: FontWeight.w800, fontSize: 24),
+        ),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(3),
+          child: Container(height: 3, color: primary),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 20, 16, 40),
+        children: [
+          // ── APPEARANCE ──────────────────────────────────────────────────
+          _sectionHeader('APPEARANCE', primary),
+          const SizedBox(height: 10),
+          _settingsCard([
+            _settingRow(
+              icon: Icons.palette,
+              label: 'Theme Color',
+              primary: primary,
+              child: Wrap(
+                spacing: 12,
+                runSpacing: 8,
+                children: _colorOptions.map((opt) {
+                  final selected = s.primaryColor.toARGB32() == opt.color.toARGB32();
+                  return GestureDetector(
+                    onTap: () => _update((s) => s.copyWith(primaryColor: opt.color)),
+                    child: Tooltip(
+                      message: opt.label,
+                      child: Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          color: opt.color,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: selected ? Colors.white : Colors.transparent,
+                            width: 3,
+                          ),
+                          boxShadow: selected
+                              ? [
+                                  BoxShadow(
+                                    color: opt.color.withValues(alpha: 0.55),
+                                    blurRadius: 10,
+                                    spreadRadius: 2,
+                                  )
+                                ]
+                              : null,
+                        ),
+                        child: selected
+                            ? const Icon(Icons.check, color: Colors.white, size: 22)
+                            : null,
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+            const Divider(height: 1),
+            _settingRow(
+              icon: Icons.text_fields,
+              label: 'Font Size',
+              primary: primary,
+              child: Row(
+                children: _fontScales.map((f) {
+                  final selected = (s.fontScale - f.scale).abs() < 0.01;
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 10),
+                    child: GestureDetector(
+                      onTap: () => _update((s) => s.copyWith(fontScale: f.scale)),
+                      child: Container(
+                        width: 48,
+                        height: 48,
+                        decoration: BoxDecoration(
+                          color: selected ? primary : Colors.white,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: primary, width: 2),
+                        ),
+                        alignment: Alignment.center,
+                        child: Text(
+                          f.label,
+                          style: TextStyle(
+                            color: selected ? Colors.white : primary,
+                            fontWeight: FontWeight.w800,
+                            fontSize: 16,
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ]),
+
+          const SizedBox(height: 22),
+
+          // ── PROFILE ─────────────────────────────────────────────────────
+          _sectionHeader('PROFILE', primary),
+          const SizedBox(height: 10),
+          _settingsCard([
+            _settingRow(
+              icon: Icons.person,
+              label: 'Name',
+              primary: primary,
+              child: _editableField(
+                controller: _nameCtrl,
+                hint: 'Enter your name',
+                primary: primary,
+                onSave: () {
+                  final name = _nameCtrl.text.trim();
+                  _update((s) => s.copyWith(patientName: name.isEmpty ? 'Patient' : name));
+                  FocusScope.of(context).unfocus();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Name updated.')),
+                  );
+                },
+              ),
+            ),
+            const Divider(height: 1),
+            _settingRow(
+              icon: Icons.phone,
+              label: 'Phone Number',
+              primary: primary,
+              child: _editableField(
+                controller: _phoneCtrl,
+                hint: 'e.g. +1 555 000 0000',
+                primary: primary,
+                keyboardType: TextInputType.phone,
+                onSave: () {
+                  _update((s) => s.copyWith(phoneNumber: _phoneCtrl.text.trim()));
+                  FocusScope.of(context).unfocus();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Phone number updated.')),
+                  );
+                },
+              ),
+            ),
+          ]),
+
+          const SizedBox(height: 22),
+
+          // ── ACCOUNT ─────────────────────────────────────────────────────
+          _sectionHeader('ACCOUNT', primary),
+          const SizedBox(height: 10),
+          _settingsCard([
+            ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              leading: Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(Icons.person_outline, color: primary),
+              ),
+              title: Text(
+                s.patientName,
+                style: TextStyle(color: primary, fontWeight: FontWeight.w700, fontSize: 18),
+              ),
+              subtitle: Text(
+                s.phoneNumber.isEmpty ? 'No phone number set' : s.phoneNumber,
+                style: const TextStyle(color: Color(0xFF4A627A)),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 14),
+
+          // Log Out button
+          FilledButton.icon(
+            onPressed: () {
+              _update((s) => s.copyWith(isLoggedIn: false));
+              Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+                PageRouteBuilder<void>(
+                  pageBuilder: (_, _, _) => const _LoginPage(),
+                  transitionsBuilder: (_, animation, _, child) =>
+                      FadeTransition(opacity: animation, child: child),
+                ),
+                (_) => false,
+              );
+            },
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFC62828),
+              minimumSize: const Size(double.infinity, 54),
+            ),
+            icon: const Icon(Icons.logout),
+            label: const Text('Log Out', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _sectionHeader(String label, Color primary) => Padding(
+        padding: const EdgeInsets.only(left: 4, bottom: 6),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: primary,
+            fontSize: 13,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 2.0,
+          ),
+        ),
+      );
+
+  Widget _settingsCard(List<Widget> children) => Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFFA3C4F3), width: 2),
+        ),
+        child: Column(children: children),
+      );
+
+  Widget _settingRow({
+    required IconData icon,
+    required String label,
+    required Color primary,
+    required Widget child,
+  }) =>
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Icon(icon, size: 20, color: primary),
+              const SizedBox(width: 8),
+              Text(label,
+                  style: TextStyle(
+                      color: primary, fontWeight: FontWeight.w700, fontSize: 16)),
+            ]),
+            const SizedBox(height: 12),
+            child,
+          ],
+        ),
+      );
+
+  Widget _editableField({
+    required TextEditingController controller,
+    required String hint,
+    required Color primary,
+    required VoidCallback onSave,
+    TextInputType keyboardType = TextInputType.text,
+  }) =>
+      Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: controller,
+              keyboardType: keyboardType,
+              style: const TextStyle(fontSize: 16),
+              decoration: InputDecoration(
+                hintText: hint,
+                isDense: true,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                filled: true,
+                fillColor: const Color(0xFFF0F4F8),
+                border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: BorderSide(color: primary, width: 1.5)),
+                enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide:
+                        BorderSide(color: primary.withValues(alpha: 0.4), width: 1.5)),
+                focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: BorderSide(color: primary, width: 2)),
+              ),
+              onSubmitted: (_) => onSave(),
+            ),
+          ),
+          const SizedBox(width: 10),
+          FilledButton(
+            onPressed: onSave,
+            style: FilledButton.styleFrom(
+              backgroundColor: primary,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 18, vertical: 13),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+            child: const Text('Save', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LOGIN PAGE
+// ══════════════════════════════════════════════════════════════════════════════
+class _LoginPage extends StatefulWidget {
+  const _LoginPage();
+
+  @override
+  State<_LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<_LoginPage> {
+  final _emailCtrl = TextEditingController();
+  final _passCtrl = TextEditingController();
+  bool _obscurePass = true;
+  String? _error;
+
+  @override
+  void dispose() {
+    _emailCtrl.dispose();
+    _passCtrl.dispose();
+    super.dispose();
+  }
+
+  void _login() {
+    if (_emailCtrl.text.trim().isEmpty || _passCtrl.text.isEmpty) {
+      setState(() => _error = 'Please enter your email and password.');
+      return;
+    }
+    _settingsNotifier.value = _settingsNotifier.value.copyWith(isLoggedIn: true);
+    Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+      PageRouteBuilder<void>(
+        pageBuilder: (_, _, _) => const MainShell(),
+        transitionsBuilder: (_, animation, _, child) =>
+            FadeTransition(opacity: animation, child: child),
+      ),
+      (_) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = _settingsNotifier.value.primaryColor;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF0F4F8),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: 40),
+              // Logo
+              Center(
+                child: Container(
+                  width: 90,
+                  height: 90,
+                  decoration: BoxDecoration(
+                    color: primary.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(Icons.visibility, size: 52, color: primary),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'Eye Resolve',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: primary, fontSize: 34, fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Log in to manage your eye health',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Color(0xFF4A627A), fontSize: 17),
+              ),
+              const SizedBox(height: 44),
+              // Email
+              Text('Email',
+                  style: TextStyle(color: primary, fontWeight: FontWeight.w700, fontSize: 15)),
+              const SizedBox(height: 6),
+              TextField(
+                controller: _emailCtrl,
+                keyboardType: TextInputType.emailAddress,
+                decoration: InputDecoration(
+                  prefixIcon: Icon(Icons.email_outlined, color: primary),
+                  hintText: 'you@example.com',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: primary, width: 2)),
+                  enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: primary, width: 2)),
+                  focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: primary, width: 2.5)),
+                ),
+              ),
+              const SizedBox(height: 18),
+              // Password
+              Text('Password',
+                  style: TextStyle(color: primary, fontWeight: FontWeight.w700, fontSize: 15)),
+              const SizedBox(height: 6),
+              TextField(
+                controller: _passCtrl,
+                obscureText: _obscurePass,
+                onSubmitted: (_) => _login(),
+                decoration: InputDecoration(
+                  prefixIcon: Icon(Icons.lock_outline, color: primary),
+                  hintText: '••••••••',
+                  filled: true,
+                  fillColor: Colors.white,
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: primary, width: 2)),
+                  enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: primary, width: 2)),
+                  focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: primary, width: 2.5)),
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      _obscurePass ? Icons.visibility_off : Icons.visibility,
+                      color: primary,
+                    ),
+                    onPressed: () => setState(() => _obscurePass = !_obscurePass),
+                  ),
+                ),
+              ),
+              if (_error != null) ...[
+                const SizedBox(height: 12),
+                Text(_error!,
+                    style: const TextStyle(color: Color(0xFFC62828), fontWeight: FontWeight.w600)),
+              ],
+              const SizedBox(height: 28),
+              FilledButton(
+                onPressed: _login,
+                style: FilledButton.styleFrom(
+                  backgroundColor: primary,
+                  minimumSize: const Size(double.infinity, 56),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                child: const Text('Log In',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+              ),
+              const SizedBox(height: 40),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _TopBar extends StatelessWidget {
   const _TopBar({required this.title});
 
@@ -2001,40 +2976,31 @@ class _TopBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const primary = Color(0xFF003366);
+    final primary = Theme.of(context).colorScheme.primary;
 
     return Container(
       height: 70,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: Colors.white,
         border: Border(bottom: BorderSide(color: primary, width: 3)),
       ),
       padding: const EdgeInsets.symmetric(horizontal: 12),
       child: Row(
         children: [
-          const Icon(Icons.visibility, color: primary, size: 30),
+          Icon(Icons.visibility, color: primary, size: 30),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
               title,
-              style: const TextStyle(color: primary, fontSize: 30, fontWeight: FontWeight.w700),
+              style: TextStyle(color: primary, fontSize: 30, fontWeight: FontWeight.w700),
             ),
           ),
           IconButton(
-            onPressed: () => showDialog<void>(
-              context: context,
-              builder: (_) => AlertDialog(
-                title: const Text('Settings'),
-                content: const Text('Profile and app settings coming soon.'),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text('Close'),
-                  ),
-                ],
-              ),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(builder: (_) => const SettingsPage()),
             ),
-            icon: const Icon(Icons.settings, color: primary),
+            icon: Icon(Icons.settings, color: primary),
           ),
         ],
       ),
