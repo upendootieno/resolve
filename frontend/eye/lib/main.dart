@@ -6,6 +6,11 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
+import 'screens/login_screen.dart';
+import 'services/auth_service.dart';
+
+final GlobalKey<NavigatorState> _rootNavigatorKey = GlobalKey<NavigatorState>();
+
 // ── Push / local notification helper ─────────────────────────────────────────
 class _AppNotifications {
   static final _plugin = FlutterLocalNotificationsPlugin();
@@ -60,7 +65,7 @@ class _AppSettings {
     this.fontScale = 1.0,
     this.phoneNumber = '',
     this.patientName = 'Patient',
-    this.isLoggedIn = true,
+    this.isLoggedIn = false,
   });
 
   final Color primaryColor;
@@ -106,6 +111,7 @@ class _EyeAppState extends State<EyeApp> {
   Widget build(BuildContext context) {
     final s = _settingsNotifier.value;
     return MaterialApp(
+      navigatorKey: _rootNavigatorKey,
       debugShowCheckedModeBanner: false,
       title: 'Eye Resolve',
       theme: ThemeData(
@@ -118,7 +124,24 @@ class _EyeAppState extends State<EyeApp> {
         data: MediaQuery.of(ctx).copyWith(textScaler: TextScaler.linear(s.fontScale)),
         child: child!,
       ),
-      home: s.isLoggedIn ? const MainShell() : const _LoginPage(),
+      home: s.isLoggedIn
+          ? const MainShell()
+          : LoginScreen(
+              onLoginSuccess: (name) {
+                _settingsNotifier.value = _settingsNotifier.value.copyWith(
+                  isLoggedIn: true,
+                  patientName: name,
+                );
+                _rootNavigatorKey.currentState?.pushAndRemoveUntil(
+                  PageRouteBuilder<void>(
+                    pageBuilder: (_, _, _) => const MainShell(),
+                    transitionsBuilder: (_, animation, __, child) =>
+                        FadeTransition(opacity: animation, child: child),
+                  ),
+                  (_) => false,
+                );
+              },
+            ),
     );
   }
 }
@@ -2504,7 +2527,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   void _update(_AppSettings Function(_AppSettings) fn) {
     _settingsNotifier.value = fn(_settingsNotifier.value);
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   @override
@@ -2692,16 +2715,28 @@ class _SettingsPageState extends State<SettingsPage> {
 
           // Log Out button
           FilledButton.icon(
-            onPressed: () {
+            onPressed: () async {
+              await AuthService.logout();
+              if (!mounted) return;
               _update((s) => s.copyWith(isLoggedIn: false));
-              Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
-                PageRouteBuilder<void>(
-                  pageBuilder: (_, _, _) => const _LoginPage(),
-                  transitionsBuilder: (_, animation, _, child) =>
-                      FadeTransition(opacity: animation, child: child),
-                ),
-                (_) => false,
-              );
+              if (context.mounted) {
+                Navigator.of(context, rootNavigator: true).pushAndRemoveUntil(
+                  PageRouteBuilder<void>(
+                    pageBuilder: (_, _, _) => LoginScreen(
+                      onLoginSuccess: (name) {
+                        _settingsNotifier.value =
+                            _settingsNotifier.value.copyWith(
+                          isLoggedIn: true,
+                          patientName: name,
+                        );
+                      },
+                    ),
+                    transitionsBuilder: (_, animation, _, child) =>
+                        FadeTransition(opacity: animation, child: child),
+                  ),
+                  (_) => false,
+                );
+              }
             },
             style: FilledButton.styleFrom(
               backgroundColor: const Color(0xFFC62828),
